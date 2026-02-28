@@ -6,13 +6,23 @@ import '../../../core/constants/tab_constants.dart';
 /// [SliverPersistentHeaderDelegate] that renders the tab bar.
 /// When [pinned: true] is used in [SliverPersistentHeader], this becomes
 /// the sticky header that remains visible once the SliverAppBar collapses.
-/// The tab bar does NOT own any scrollable — it only drives [currentTabIndex].
+///
+/// The tab bar is driven by a continuous [tabPosition] (double) rather than
+/// a discrete integer so that the indicator and label colours update in
+/// real-time as the user drags between tabs.
+///
+/// Examples:
+///   0.0   → fully on tab 0
+///   0.5   → halfway between tab 0 and tab 1
+///   1.0   → fully on tab 1
+///   1.75  → 75 % of the way from tab 1 toward tab 2
 class StickyTabBarDelegate extends SliverPersistentHeaderDelegate {
-  final int currentIndex;
+  /// Continuous tab position. Can be fractional during a swipe gesture.
+  final double tabPosition;
   final ValueChanged<int> onTabChanged;
 
   const StickyTabBarDelegate({
-    required this.currentIndex,
+    required this.tabPosition,
     required this.onTabChanged,
   });
 
@@ -26,7 +36,7 @@ class StickyTabBarDelegate extends SliverPersistentHeaderDelegate {
 
   @override
   bool shouldRebuild(covariant StickyTabBarDelegate old) =>
-      old.currentIndex != currentIndex;
+      old.tabPosition != tabPosition;
 
   @override
   Widget build(
@@ -36,8 +46,6 @@ class StickyTabBarDelegate extends SliverPersistentHeaderDelegate {
   ) {
     return Container(
       height: _height,
-      // NOTE: color must NOT be set here when decoration is used — Flutter throws
-      // an assertion if both are provided. The color lives inside BoxDecoration.
       decoration: const BoxDecoration(
         color: AppColors.white,
         border: Border(
@@ -46,7 +54,28 @@ class StickyTabBarDelegate extends SliverPersistentHeaderDelegate {
       ),
       child: Row(
         children: List.generate(kTabLabels.length, (i) {
-          final isSelected = i == currentIndex;
+          // How "selected" is tab i, as a value between 0.0 and 1.0?
+          //   1.0 → the indicator is exactly here
+          //   0.5 → the finger is halfway between this tab and a neighbour
+          //   0.0 → fully deselected
+          final distance = (i - tabPosition).abs();
+          final selectionFraction = (1.0 - distance).clamp(0.0, 1.0);
+
+          final labelColor = Color.lerp(
+            AppColors.greyText,
+            AppColors.pink,
+            selectionFraction,
+          )!;
+
+          final fontWeight = selectionFraction > 0.5
+              ? FontWeight.w700
+              : FontWeight.w500;
+
+          // Indicator width scales from 0 (fully deselected) to 36 (fully
+          // selected) proportionally to [selectionFraction].
+          const double maxIndicatorWidth = 36.0;
+          final indicatorWidth = selectionFraction * maxIndicatorWidth;
+
           return Expanded(
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
@@ -58,22 +87,19 @@ class StickyTabBarDelegate extends SliverPersistentHeaderDelegate {
                     kTabLabels[i],
                     style: TextStyle(
                       fontSize: 13,
-                      fontWeight: isSelected
-                          ? FontWeight.w700
-                          : FontWeight.w500,
-                      color: isSelected
-                          ? AppColors.pink
-                          : AppColors.greyText,
+                      fontWeight: fontWeight,
+                      color: labelColor,
                     ),
                   ),
                   const SizedBox(height: 4),
-                  // Animated selection indicator
-                  AnimatedContainer(
-                    duration: const Duration(milliseconds: 200),
+                  // Selection indicator — width and colour follow the gesture
+                  // in real time; no AnimatedContainer needed.
+                  Container(
                     height: 2.5,
-                    width: isSelected ? 36 : 0,
+                    width: indicatorWidth,
                     decoration: BoxDecoration(
-                      color: AppColors.pink,
+                      color: AppColors.pink
+                          .withValues(alpha: selectionFraction),
                       borderRadius: BorderRadius.circular(2),
                     ),
                   ),

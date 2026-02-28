@@ -19,12 +19,19 @@ import '../widgets/sticky_tab_bar_delegate.dart';
 //        Uses a PageView driven by a Timer (NeverScrollableScrollPhysics).
 //        No horizontal gesture recognizer → no conflict with tab swipe.
 //   3. SliverPersistentHeader (pinned) — tab bar sticks once banner scrolls off.
-//   4. SliverToBoxAdapter — animated product grid.
+//   4. SliverToBoxAdapter — gesture-driven swipe content.
 //
 // VERTICAL SCROLL: single CustomScrollView owns the axis.
-// HORIZONTAL SWIPE: _HorizontalSwipeDetector wraps the CSW. Axis isolation
-//   via Flutter's gesture arena (vertical drag → CSW wins; horizontal drag →
-//   swipe detector wins). Banner PageView is timer-only so it doesn't compete.
+// HORIZONTAL SWIPE: GestureDetector on the Scaffold body with axis isolation.
+//   Drag progress is tracked in real-time via [_swipeAnim]:
+//     • 0.0 = settled on [_settledTabIndex]
+//     • 1.0 = fully transitioned to [_targetTabIndex]
+//   During drag, both the current and target content panels are rendered
+//   side-by-side (clipped) and translated proportionally to swipe distance.
+//   On finger-lift the controller snaps to 1.0 (complete) or 0.0 (cancel)
+//   depending on velocity and travel distance.
+//   The tab-bar indicator receives a continuous [double tabPosition] so it
+//   follows the drag in real time rather than jumping between integers.
 // ───────────────────────────────────────────────────────────────────────────
 
 class HomeScreen extends ConsumerStatefulWidget {
@@ -37,99 +44,279 @@ class HomeScreen extends ConsumerStatefulWidget {
 class _HomeScreenState extends ConsumerState<HomeScreen>
     with SingleTickerProviderStateMixin {
   /// The single [ScrollController] for the entire screen.
-  /// Created once; never reassigned so scroll position is never reset.
   late final ScrollController _scrollController;
-
-  /// Drives the exit/enter animation for tab content.
-  /// reverse() = exit (1→0), forward() = enter (0→1).
-  late final AnimationController _tabAnim;
 
   // Height of the always-visible pinned search bar.
   static const double _searchBarHeight = 58.0;
 
-  /// The tab whose data is currently rendered in the GridView.
-  /// This is intentionally SEPARATE from [currentTabProvider] so that the
-  /// tab bar indicator snaps immediately while the content animates.
-  int _displayedTabIndex = 0;
+  // ─── Swipe state ──────────────────────────────────────────────────────
 
-  /// Whether the current animation phase is an enter (true) or exit (false).
-  bool _isAnimatingIn = false;
+  /// The tab that is fully visible when no swipe is in progress.
+  int _settledTabIndex = 0;
 
-  /// The direction of the current/last tab transition.
-  bool _isGoingForward = true;
+  /// The tab being swiped toward. null when idle.
+  int? _targetTabIndex;
+
+  /// true  = swiping from settled → higher index (left swipe)
+  /// false = swiping from settled → lower  index (right swipe)
+  bool _dragForward = true;
+
+  /// Horizontal start position of the current drag on screen (px).
+  double? _dragStartX;
+
+  /// Screen width — cached in [build] so gesture handlers can reference it
+  /// without a [BuildContext].
+  double _screenWidth = 400.0;
+
+  /// Drives swipe progress: 0.0 = settled, 1.0 = transition complete.
+  ///
+  /// During a drag this is set directly (`value = pixels / screenWidth`).
+  /// After finger-lift it is animated to 0 or 1.
+  /// An [addListener] on this controller calls [setState] so every frame
+  /// during an animation (or direct-drive) triggers a rebuild.
+  late final AnimationController _swipeAnim;
+
+  // ─── Computed helpers ────────────────────────────────────────────────
+
+  /// Continuous tab position for the indicator, e.g. 0.5 = halfway between
+  /// tab 0 and tab 1.
+  double get _tabPosition {
+    final target = _targetTabIndex;
+    if (target == null) return _settledTabIndex.toDouble();
+    final direction = _dragForward ? 1.0 : -1.0;
+    return _settledTabIndex + direction * _swipeAnim.value;
+  }
+
+  // ─── Lifecycle ───────────────────────────────────────────────────────
 
   @override
   void initState() {
     super.initState();
     _scrollController = ScrollController();
-    _tabAnim = AnimationController(
+    _swipeAnim = AnimationController(
       vsync: this,
-      // Each phase (exit or enter) is 160 ms — total visual transition ~320 ms.
-      duration: const Duration(milliseconds: 160),
-      value: 1.0, // start fully visible
-    );
+      duration: const Duration(milliseconds: 260),
+    )..addListener(() => setState(() {}));
   }
 
   @override
   void dispose() {
     _scrollController.dispose();
-    _tabAnim.dispose();
+    _swipeAnim.dispose();
     super.dispose();
   }
 
-  // ─── Tab navigation helpers ─────────────────────────────────────────────
+  // ─── Tab-tap navigation (programmatic) ──────────────────────────────
 
-  Future<void> _goToTab(int index) async {
+  void _goToTab(int index) {
     if (index < 0 || index >= kTabCategories.length) return;
-    if (index == _displayedTabIndex) return;
-    // Ignore rapid taps while an animation is running.
-    if (_tabAnim.isAnimating) return;
+    if (index == _settledTabIndex) return;
+    if (_swipeAnim.isAnimating) return;
 
-    _isGoingForward = index > _displayedTabIndex;
-
-    // Snap the tab bar indicator to the new tab immediately (good UX).
+    _dragForward = index > _settledTabIndex;
+    _targetTabIndex = index;
     ref.read(currentTabProvider.notifier).state = index;
 
-    // ── Phase 1: animate content OUT ─────────────────────────────────────
-    _isAnimatingIn = false;
-    await _tabAnim.reverse(); // 1.0 → 0.0
-
-    // ── Phase 2: swap data (single setState, no extra frames) ────────────
-    setState(() => _displayedTabIndex = index);
-
-    // ── Phase 3: animate NEW content IN ──────────────────────────────────
-    _isAnimatingIn = true;
-    await _tabAnim.forward(); // 0.0 → 1.0
+    _swipeAnim.animateTo(
+      1.0,
+      duration: const Duration(milliseconds: 260),
+      curve: Curves.easeOut,
+    ).then((_) {
+      if (mounted) _commitSwipe();
+    });
   }
 
-  void _nextTab() => _goToTab(ref.read(currentTabProvider) + 1);
-  void _prevTab() => _goToTab(ref.read(currentTabProvider) - 1);
+  // ─── Swipe completion / cancellation ────────────────────────────────
+
+  /// Called when the animation reaches 1.0 — makes the target the new settled
+  /// tab and resets the animation to 0 without triggering a visible frame.
+  void _commitSwipe() {
+    final target = _targetTabIndex;
+    if (target == null) return;
+    // Update settled index BEFORE resetting the controller so the build that
+    // follows _swipeAnim.value = 0 renders the correct single panel.
+    _settledTabIndex = target;
+    _targetTabIndex = null;
+    ref.read(currentTabProvider.notifier).state = _settledTabIndex;
+    _swipeAnim.value = 0.0; // silent reset — listener calls setState once more
+  }
+
+  /// Snaps the animation back to 0 (cancelled / not enough gesture).
+  void _cancelSwipe() {
+    _swipeAnim
+        .animateTo(
+          0.0,
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOut,
+        )
+        .then((_) {
+          if (mounted) {
+            setState(() {
+              _targetTabIndex = null;
+              ref.read(currentTabProvider.notifier).state = _settledTabIndex;
+            });
+          }
+        });
+  }
+
+  // ─── Gesture handlers ────────────────────────────────────────────────
+
+  void _onHorizontalDragStart(DragStartDetails details) {
+    if (_swipeAnim.isAnimating) return;
+    _dragStartX = details.globalPosition.dx;
+  }
+
+  void _onHorizontalDragUpdate(DragUpdateDetails details) {
+    final startX = _dragStartX;
+    if (startX == null) return;
+
+    final delta = details.globalPosition.dx - startX;
+
+    // ── Determine drag direction and set target on first meaningful move ──
+    if (_targetTabIndex == null) {
+      if (delta < 0 && _settledTabIndex < kTabCategories.length - 1) {
+        _dragForward = true;
+        _targetTabIndex = _settledTabIndex + 1;
+        // Move indicator ahead immediately so it follows the drag.
+        ref.read(currentTabProvider.notifier).state = _targetTabIndex!;
+      } else if (delta > 0 && _settledTabIndex > 0) {
+        _dragForward = false;
+        _targetTabIndex = _settledTabIndex - 1;
+        ref.read(currentTabProvider.notifier).state = _targetTabIndex!;
+      } else {
+        return; // already at first/last tab — nothing to do
+      }
+    }
+
+    // ── Guard: ignore if user reverses direction mid-gesture ─────────────
+    final correctDir =
+        (_dragForward && delta < 0) || (!_dragForward && delta > 0);
+    if (!correctDir) {
+      // Treat reversal as a cancel and reset.
+      _swipeAnim.value = 0.0;
+      _targetTabIndex = null;
+      ref.read(currentTabProvider.notifier).state = _settledTabIndex;
+      _dragStartX = details.globalPosition.dx; // reset origin
+      return;
+    }
+
+    // ── Drive animation proportionally to drag travel ─────────────────
+    final progress = (delta.abs() / _screenWidth).clamp(0.0, 1.0);
+    _swipeAnim.value = progress; // triggers setState via addListener
+  }
+
+  void _onHorizontalDragEnd(DragEndDetails details) {
+    _dragStartX = null;
+    if (_targetTabIndex == null) return;
+
+    final velocity = details.primaryVelocity ?? 0.0;
+    final progress = _swipeAnim.value;
+
+    // Complete when travel > 50 % OR fast enough velocity in the right dir.
+    const velocityThreshold = 500.0;
+    final fastEnough =
+        (_dragForward && velocity < -velocityThreshold) ||
+        (!_dragForward && velocity > velocityThreshold);
+
+    if (progress > 0.5 || fastEnough) {
+      _swipeAnim
+          .animateTo(
+            1.0,
+            duration: Duration(milliseconds: ((1.0 - progress) * 200).round()),
+            curve: Curves.easeOut,
+          )
+          .then((_) {
+            if (mounted) _commitSwipe();
+          });
+    } else {
+      _cancelSwipe();
+    }
+  }
+
+  void _onHorizontalDragCancel() {
+    _dragStartX = null;
+    if (_targetTabIndex != null) _cancelSwipe();
+  }
+
+  // ─── Dual-panel swipe content builder ───────────────────────────────────
+  //
+  // When idle: renders a single _TabGridContent for [_settledTabIndex].
+  // During swipe: renders TWO panels in a Stack, each translated by the
+  // current swipe progress so the UI is 1-to-1 with the user's finger:
+  //
+  //   progress = _swipeAnim.value  (0.0 → 1.0)
+  //   screenWidth = _screenWidth
+  //
+  //   Forward swipe (left, going to a higher index):
+  //     • Current panel: x = -progress × screenWidth   (slides out left)
+  //     • Target  panel: x =  (1-progress) × screenWidth (slides in from right)
+  //
+  //   Backward swipe (right, going to a lower index):
+  //     • Current panel: x = +progress × screenWidth   (slides out right)
+  //     • Target  panel: x = -(1-progress) × screenWidth (slides in from left)
+  //
+  // Both panels are wrapped in ClipRect (caller) so they never overflow.
+  // Stack sizes to max(current, target) height — imperceptible during motion.
+  Widget _buildSwipeContent() {
+    final target = _targetTabIndex;
+    final progress = _swipeAnim.value;
+
+    // ── Idle: single panel, no overhead ──────────────────────────────────
+    if (target == null || progress == 0.0) {
+      return _TabGridContent(tabIndex: _settledTabIndex);
+    }
+
+    final currentOffset = _dragForward
+        ? Offset(-progress * _screenWidth, 0)
+        : Offset(progress * _screenWidth, 0);
+
+    final targetOffset = _dragForward
+        ? Offset((1.0 - progress) * _screenWidth, 0)
+        : Offset(-(1.0 - progress) * _screenWidth, 0);
+
+    return Stack(
+      children: [
+        Transform.translate(
+          offset: currentOffset,
+          child: _TabGridContent(tabIndex: _settledTabIndex),
+        ),
+        Transform.translate(
+          offset: targetOffset,
+          child: _TabGridContent(tabIndex: target),
+        ),
+      ],
+    );
+  }
 
   // ─── Pull-to-refresh ────────────────────────────────────────────────────
 
   Future<void> _onRefresh() async {
-    final category = kTabCategories[_displayedTabIndex];
+    final category = kTabCategories[_settledTabIndex];
     ref.invalidate(productsByCategoryProvider(category));
     await ref.read(productsByCategoryProvider(category).future);
   }
 
   @override
   Widget build(BuildContext context) {
-    // currentTabProvider is watched only to keep the tab bar indicator in sync.
-    final currentTab = ref.watch(currentTabProvider);
+    // Watch only to keep _goToTab in sync; tab bar is driven by _tabPosition.
+    ref.watch(currentTabProvider);
     final authState = ref.watch(authProvider);
     final user = authState is AuthAuthenticated ? authState.user : null;
-    final screenWidth = MediaQuery.of(context).size.width;
+
+    // Cache screen width so gesture callbacks can access it without context.
+    _screenWidth = MediaQuery.of(context).size.width;
 
     return Scaffold(
       backgroundColor: AppColors.lightGrey,
       body: SafeArea(
-        child: _HorizontalSwipeDetector(
-          onSwipeLeft: _nextTab,
-          onSwipeRight: _prevTab,
-          // 300 px/s velocity + 40 px travel both required → intentional swipes only
-          velocityThreshold: 300.0,
-          distanceThreshold: 40.0,
+        child: GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          // ── Axis isolation: Flutter's arena gives vertical drags to the
+          // CustomScrollView; horizontal drags are claimed by this detector.
+          onHorizontalDragStart: _onHorizontalDragStart,
+          onHorizontalDragUpdate: _onHorizontalDragUpdate,
+          onHorizontalDragEnd: _onHorizontalDragEnd,
+          onHorizontalDragCancel: _onHorizontalDragCancel,
           child: RefreshIndicator(
             onRefresh: _onRefresh,
             color: AppColors.orange,
@@ -167,41 +354,26 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
 
                 // ── 3. Sticky Tab Bar ──────────────────────────────────────
                 // pinned:true → locks to top once the banner sliver scrolls off.
+                // [tabPosition] is a continuous double so the indicator tracks
+                // the drag in real time (e.g. 0.5 = halfway between tab 0 and 1).
                 SliverPersistentHeader(
                   pinned: true,
                   delegate: StickyTabBarDelegate(
-                    currentIndex: currentTab,
+                    tabPosition: _tabPosition,
                     onTabChanged: _goToTab,
                   ),
                 ),
 
-                // ── 4. Animated product grid ───────────────────────────────
+                // ── 4. Gesture-driven swipe content ───────────────────────
+                // During a swipe two _TabGridContent panels are rendered
+                // side-by-side inside a ClipRect:
+                //   • Current panel translates from x=0 → x=±screenWidth
+                //   • Target  panel translates from x=∓screenWidth → x=0
+                // Progress is the raw _swipeAnim.value (0.0-1.0) so the
+                // visual movement is always 1:1 with the user's finger.
                 SliverToBoxAdapter(
                   child: ClipRect(
-                    child: AnimatedBuilder(
-                      animation: _tabAnim,
-                      child: _TabGridContent(tabIndex: _displayedTabIndex),
-                      builder: (context, child) {
-                        final val = _tabAnim.value;
-                        final Offset offset;
-                        if (_isAnimatingIn) {
-                          offset = _isGoingForward
-                              ? Offset((1.0 - val) * screenWidth, 0)
-                              : Offset(-(1.0 - val) * screenWidth, 0);
-                        } else {
-                          offset = _isGoingForward
-                              ? Offset(-(1.0 - val) * screenWidth, 0)
-                              : Offset((1.0 - val) * screenWidth, 0);
-                        }
-                        return Opacity(
-                          opacity: val.clamp(0.0, 1.0),
-                          child: Transform.translate(
-                            offset: offset,
-                            child: child,
-                          ),
-                        );
-                      },
-                    ),
+                    child: _buildSwipeContent(),
                   ),
                 ),
               ],
@@ -213,111 +385,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
   }
 }
 
-// ─── Horizontal swipe detector ─────────────────────────────────────────────
-//
-// Design decisions:
-//
-// 1. AXIS ISOLATION
-//    [GestureDetector] here ONLY handles the horizontal drag recognizer.
-//    Flutter's gesture arena uses axis-first disambiguation:
-//      • Vertical component moves > kTouchSlop first → [CustomScrollView] wins,
-//        horizontal drag recognizer is rejected → no swipe fires ✓
-//      • Horizontal component moves > kTouchSlop first → this detector wins,
-//        vertical scroll recognizer is rejected → no scroll fires ✓
-//    The two axes can never both activate simultaneously.
-//
-// 2. INTENTIONAL SWIPE GATE (dual threshold)
-//    A swipe is only registered when BOTH conditions are met:
-//      a) primaryVelocity  ≥ [velocityThreshold]  (fast enough)
-//      b) |horizontal travel| ≥ [distanceThreshold] (far enough)
-//    This eliminates accidental micro-swipes and high-velocity taps.
-//
-// 3. HitTestBehavior.translucent
-//    Child widgets (product cards, tab bar taps) still receive all hit-tests.
-//    This detector does NOT block tap events from reaching descendants.
-
-class _HorizontalSwipeDetector extends StatefulWidget {
-  final Widget child;
-  final VoidCallback onSwipeLeft;
-  final VoidCallback onSwipeRight;
-  final double velocityThreshold;
-  /// Minimum horizontal travel (px) required to count as a swipe.
-  final double distanceThreshold;
-
-  const _HorizontalSwipeDetector({
-    required this.child,
-    required this.onSwipeLeft,
-    required this.onSwipeRight,
-    required this.velocityThreshold,
-    required this.distanceThreshold,
-  });
-
-  @override
-  State<_HorizontalSwipeDetector> createState() =>
-      _HorizontalSwipeDetectorState();
-}
-
-class _HorizontalSwipeDetectorState extends State<_HorizontalSwipeDetector> {
-  double? _dragStartX;
-  double _dragCurrentX = 0;
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      behavior: HitTestBehavior.translucent,
-
-      // Record the start position so we can measure travel distance.
-      onHorizontalDragStart: (details) {
-        _dragStartX = details.globalPosition.dx;
-        _dragCurrentX = details.globalPosition.dx;
-      },
-
-      // Keep current X up to date on every frame of the drag.
-      onHorizontalDragUpdate: (details) {
-        _dragCurrentX = details.globalPosition.dx;
-      },
-
-      // Fire only when this recognizer has already won the arena —
-      // meaning Flutter confirmed the drag was primarily horizontal.
-      // The vertical scroll has been rejected at this point.
-      onHorizontalDragEnd: (details) {
-        final startX = _dragStartX;
-        _dragStartX = null;
-        if (startX == null) return;
-
-        final velocity = details.primaryVelocity ?? 0;
-        final distance = _dragCurrentX - startX; // positive = right, negative = left
-
-        // Both thresholds must be met — prevents accidental swipes.
-        final isLeftSwipe =
-            velocity < -widget.velocityThreshold &&
-            distance < -widget.distanceThreshold;
-        final isRightSwipe =
-            velocity > widget.velocityThreshold &&
-            distance > widget.distanceThreshold;
-
-        if (isLeftSwipe) {
-          widget.onSwipeLeft();
-        } else if (isRightSwipe) {
-          widget.onSwipeRight();
-        }
-      },
-
-      onHorizontalDragCancel: () {
-        _dragStartX = null;
-        _dragCurrentX = 0;
-      },
-
-      child: widget.child,
-    );
-  }
-}
-
 // ─── Banner carousel ──────────────────────────────────────────────────────
 //
 // Uses a [PageView] with [NeverScrollableScrollPhysics] driven entirely by
 // a [Timer]. No horizontal gesture recognizer is registered, so the outer
-// [_HorizontalSwipeDetector] handles tab-swipe without any arena conflict.
+// GestureDetector (in HomeScreen) handles tab-swipe without any arena conflict.
 
 class _BannerSlide {
   final String assetPath;
