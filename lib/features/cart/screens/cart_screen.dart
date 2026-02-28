@@ -8,8 +8,8 @@ class CartScreen extends StatelessWidget {
   static const List<_MockCartItem> _items = [
     _MockCartItem(
       name: 'Wireless Noise Cancelling Headphones',
-      price: 'PKR 8,500',
-      originalPrice: 'PKR 12,000',
+      price: '৳8,500',
+      originalPrice: '৳12,000',
       discount: '29%',
       icon: Icons.headphones_rounded,
       iconColor: Color(0xFF1976D2),
@@ -18,8 +18,8 @@ class CartScreen extends StatelessWidget {
     ),
     _MockCartItem(
       name: 'Smart Watch Series 6 — Black',
-      price: 'PKR 15,900',
-      originalPrice: 'PKR 22,000',
+      price: '৳15,900',
+      originalPrice: '৳22,000',
       discount: '28%',
       icon: Icons.watch_rounded,
       iconColor: Color(0xFF424242),
@@ -28,8 +28,8 @@ class CartScreen extends StatelessWidget {
     ),
     _MockCartItem(
       name: 'Men\'s Slim Fit Casual Jacket',
-      price: 'PKR 3,200',
-      originalPrice: 'PKR 4,800',
+      price: '৳3,200',
+      originalPrice: '৳4,800',
       discount: '33%',
       icon: Icons.checkroom_rounded,
       iconColor: AppColors.orange,
@@ -44,7 +44,7 @@ class CartScreen extends StatelessWidget {
   String get _subtotal {
     final amounts = [8500, 15900, 6400]; // qty-adjusted
     final total = amounts.fold<int>(0, (a, b) => a + b);
-    return 'PKR ${_formatNum(total)}';
+    return '৳${_formatNum(total)}';
   }
 
   String _formatNum(int n) {

@@ -12,9 +12,10 @@ class ProductCard extends StatelessWidget {
   // ── Derived display values ─────────────────────────────────────────────
   // FakeStore has no discount data — derive a deterministic fake discount
   // so the UI looks realistic. Uses product.id so it's stable across rebuilds.
+  static const double _usdToBdt = 110.0; // 1 USD ≈ 110 BDT
   int get _discountPercent => ((product.id % 5) + 1) * 10; // 10–50 %
   double get _originalPrice => product.price / (1 - _discountPercent / 100);
-  int get _coinsSave => (product.price * 0.03).round().clamp(1, 999);
+  int get _coinsSave => (product.price * _usdToBdt * 0.03).round().clamp(1, 9999);
   bool get _hasFreeDelivery => product.id % 3 != 0;
   bool get _hasCoins => product.id % 2 == 0;
 
@@ -133,7 +134,7 @@ class ProductCard extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.end,
                   children: [
                     Text(
-                      '\$${product.price.toStringAsFixed(0)}',
+                      '৳${(product.price * _usdToBdt).toStringAsFixed(0)}',
                       style: const TextStyle(
                         fontSize: 15,
                         fontWeight: FontWeight.w800,
@@ -142,7 +143,7 @@ class ProductCard extends StatelessWidget {
                     ),
                     const SizedBox(width: 4),
                     Text(
-                      '\$${_originalPrice.toStringAsFixed(0)}',
+                      '৳${(_originalPrice * _usdToBdt).toStringAsFixed(0)}',
                       style: const TextStyle(
                         fontSize: 11,
                         color: AppColors.greyText,
@@ -157,7 +158,7 @@ class ProductCard extends StatelessWidget {
                 // Coins save
                 if (_hasCoins)
                   Text(
-                    'Coins save \$$_coinsSave',
+                    'Coins save ৳$_coinsSave',
                     style: const TextStyle(
                       fontSize: 10,
                       color: AppColors.orange,

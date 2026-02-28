@@ -53,7 +53,7 @@ class MessagesScreen extends StatelessWidget {
     ),
     _MockMessage(
       sender: 'Daraz Wallet',
-      preview: 'PKR 500 Daraz Cash credited to your account.',
+      preview: '৳500 Daraz Cash credited to your account.',
       time: 'Mon',
       unread: 0,
       icon: Icons.account_balance_wallet_outlined,
