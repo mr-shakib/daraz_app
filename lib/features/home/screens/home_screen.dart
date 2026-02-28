@@ -1,10 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/constants/app_colors.dart';
 import '../../../core/constants/tab_constants.dart';
 import '../../auth/providers/auth_provider.dart';
-import '../../profile/screens/profile_screen.dart';
 import '../providers/products_provider.dart';
 import '../providers/tab_provider.dart';
 import '../widgets/product_card.dart';
@@ -12,49 +13,18 @@ import '../widgets/sticky_tab_bar_delegate.dart';
 
 // ─── Architecture Notes ────────────────────────────────────────────────────
 //
-// VERTICAL SCROLL OWNERSHIP:
-//   A single [CustomScrollView] owns the entire vertical scroll axis.
-//   There is no [TabBarView], no [PageView], no nested [ListView].
-//   The [ScrollController] is created once at this level and never recreated,
-//   so scroll position is preserved across tab changes.
+// SLIVER STRUCTURE (top → bottom):
+//   1. SliverAppBar (pinned, zero expand) — search bar, always visible.
+//   2. SliverToBoxAdapter — horizontal banner carousel.
+//        Uses a PageView driven by a Timer (NeverScrollableScrollPhysics).
+//        No horizontal gesture recognizer → no conflict with tab swipe.
+//   3. SliverPersistentHeader (pinned) — tab bar sticks once banner scrolls off.
+//   4. SliverToBoxAdapter — animated product grid.
 //
-// HORIZONTAL SWIPE:
-//   A [GestureDetector] wraps the [CustomScrollView] and listens only to
-//   [onHorizontalDragEnd]. Because Flutter's gesture arena resolves
-//   conflicts by axis, the vertical scroll continues to be handled by
-//   [CustomScrollView] unimpeded. The horizontal drag is intercepted here
-//   and translated into a tab index change.
-//
-// TAB SWITCHING & SCROLL POSITION:
-//   Switching tabs only updates [currentTabProvider] (for the tab bar) and
-//   [_displayedTabIndex] (for the grid content) at the right time.
-//   The [CustomScrollView] and its [ScrollController] are never touched,
-//   so scroll offset is preserved exactly.
-//
-// TAB TRANSITION ANIMATION:
-//   A phase-based [AnimationController] ensures only ONE [_TabGridContent]
-//   is ever in the widget tree at a time:
-//     Phase 1 (reverse 1→0): current content fades + slides out.
-//     Phase 2 (setState):    _displayedTabIndex swaps.
-//     Phase 3 (forward 0→1): new content fades + slides in.
-//   [Transform.translate] is paint-only — it never affects the layout
-//   geometry of the [SliverToBoxAdapter], so the sliver heights and the
-//   scroll position are completely stable during animation (zero jitter).
-//   [ClipRect] confines the paint to the content bounds so the sliding
-//   content never bleeds over the pinned tab bar above.
-//
-// PULL TO REFRESH:
-//   [RefreshIndicator] wraps the single [CustomScrollView]. Since there is
-//   only one scrollable, it correctly intercepts the overscroll gesture from
-//   any tab.
-//
-// TRADE-OFFS:
-//   • No animated page-slide transition when switching tabs — accepted to
-//     avoid the scroll-conflict introduced by [PageView].
-//   • Scroll position is shared across tabs (not per-tab independent offsets).
-//     The requirement says "must not reset/jump", which this satisfies.
-//     Per-tab independent offsets would require multiple [ScrollController]s
-//     and multiple scrollables — violating the single-scrollable constraint.
+// VERTICAL SCROLL: single CustomScrollView owns the axis.
+// HORIZONTAL SWIPE: _HorizontalSwipeDetector wraps the CSW. Axis isolation
+//   via Flutter's gesture arena (vertical drag → CSW wins; horizontal drag →
+//   swipe detector wins). Banner PageView is timer-only so it doesn't compete.
 // ───────────────────────────────────────────────────────────────────────────
 
 class HomeScreen extends ConsumerStatefulWidget {
@@ -74,8 +44,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
   /// reverse() = exit (1→0), forward() = enter (0→1).
   late final AnimationController _tabAnim;
 
-  // Collapsed / expanded extents for the SliverAppBar
-  static const double _expandedHeight = 160.0;
+  // Height of the always-visible pinned search bar.
+  static const double _searchBarHeight = 58.0;
 
   /// The tab whose data is currently rendered in the GridView.
   /// This is intentionally SEPARATE from [currentTabProvider] so that the
@@ -168,40 +138,35 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
               controller: _scrollController,
               physics: const AlwaysScrollableScrollPhysics(),
               slivers: [
-                // ── 1. Collapsible AppBar ──────────────────────────────────
-                // pinned:true keeps the search bar visible after collapse.
+                // ── 1. Pinned search bar ───────────────────────────────────
+                // expandedHeight == toolbarHeight → no collapsing, always
+                // the same height. The search bar is always fully visible.
                 SliverAppBar(
                   pinned: true,
                   floating: false,
                   snap: false,
-                  expandedHeight: _expandedHeight,
+                  toolbarHeight: _searchBarHeight,
+                  expandedHeight: _searchBarHeight,
                   backgroundColor: Colors.white,
                   elevation: 0,
-                  toolbarHeight: 0,
+                  automaticallyImplyLeading: false,
                   flexibleSpace: FlexibleSpaceBar(
                     collapseMode: CollapseMode.pin,
-                    background: _BannerContent(
-                      username: user?.name.firstname ?? '',
-                      onProfileTap: user == null
-                          ? null
-                          : () => Navigator.push(
-                                context,
-                                MaterialPageRoute(
-                                  builder: (_) => const ProfileScreen(),
-                                ),
-                              ),
-                    ),
-                  ),
-                  // This PreferredSize widget is what remains visible when
-                  // the header is fully collapsed — search bar is always shown.
-                  bottom: PreferredSize(
-                    preferredSize: const Size.fromHeight(58),
-                    child: _SearchBar(),
+                    background: _SearchBar(),
                   ),
                 ),
 
-                // ── 2. Sticky Tab Bar ──────────────────────────────────────
-                // pinned:true → locks to top once SliverAppBar is collapsed.
+                // ── 2. Banner carousel ────────────────────────────────────
+                // Scrolls away with the page. Once it leaves the viewport,
+                // the tab bar (below) pins to the top.
+                SliverToBoxAdapter(
+                  child: _BannerCarousel(
+                    username: user?.name.firstname ?? '',
+                  ),
+                ),
+
+                // ── 3. Sticky Tab Bar ──────────────────────────────────────
+                // pinned:true → locks to top once the banner sliver scrolls off.
                 SliverPersistentHeader(
                   pinned: true,
                   delegate: StickyTabBarDelegate(
@@ -210,60 +175,35 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
                   ),
                 ),
 
-                // ── 3. Animated product grid ───────────────────────────────
-                //
-                // KEY INVARIANT: only ONE GridView is ever in the tree.
-                //
-                // [AnimatedBuilder] rebuilds only on animation ticks.
-                // [Transform.translate] is paint-only — it does NOT affect
-                // layout or the measured height of the SliverToBoxAdapter,
-                // so the scroll position and sliver geometry are never
-                // disturbed during the transition.
-                //
-                // [Opacity] widget is used here intentionally (not
-                // [FadeTransition]) because we control the animation phases
-                // manually and need exact opacity values.
+                // ── 4. Animated product grid ───────────────────────────────
                 SliverToBoxAdapter(
                   child: ClipRect(
-                    // ClipRect prevents the sliding content from painting
-                    // outside the SliverToBoxAdapter bounds (i.e. over the
-                    // pinned tab bar or outside the screen edges).
                     child: AnimatedBuilder(
-                    animation: _tabAnim,
-                    // child is rebuilt only when _displayedTabIndex changes
-                    // (i.e. in Phase 2), not on every animation frame.
-                    child: _TabGridContent(tabIndex: _displayedTabIndex),
-                    builder: (context, child) {
-                      final val = _tabAnim.value; // 0.0 → 1.0
-
-                      // Compute horizontal offset.
-                      // Transform.translate is paint-only: layout height is
-                      // always the final GridView height → zero layout jitter.
-                      final Offset offset;
-                      if (_isAnimatingIn) {
-                        // Enter: new content slides in from the appropriate edge.
-                        offset = _isGoingForward
-                            ? Offset((1.0 - val) * screenWidth, 0)
-                            : Offset(-(1.0 - val) * screenWidth, 0);
-                      } else {
-                        // Exit: current content slides out to the appropriate edge.
-                        // val goes 1→0 during reverse(), so (1-val) goes 0→1.
-                        offset = _isGoingForward
-                            ? Offset(-(1.0 - val) * screenWidth, 0)
-                            : Offset((1.0 - val) * screenWidth, 0);
-                      }
-
-                      return Opacity(
-                        opacity: val.clamp(0.0, 1.0),
-                        child: Transform.translate(
-                          offset: offset,
-                          child: child,
-                        ),
-                      );
-                    },
+                      animation: _tabAnim,
+                      child: _TabGridContent(tabIndex: _displayedTabIndex),
+                      builder: (context, child) {
+                        final val = _tabAnim.value;
+                        final Offset offset;
+                        if (_isAnimatingIn) {
+                          offset = _isGoingForward
+                              ? Offset((1.0 - val) * screenWidth, 0)
+                              : Offset(-(1.0 - val) * screenWidth, 0);
+                        } else {
+                          offset = _isGoingForward
+                              ? Offset(-(1.0 - val) * screenWidth, 0)
+                              : Offset((1.0 - val) * screenWidth, 0);
+                        }
+                        return Opacity(
+                          opacity: val.clamp(0.0, 1.0),
+                          child: Transform.translate(
+                            offset: offset,
+                            child: child,
+                          ),
+                        );
+                      },
+                    ),
                   ),
-                  ), // ClipRect
-                ), // SliverToBoxAdapter
+                ),
               ],
             ),
           ),
@@ -373,63 +313,120 @@ class _HorizontalSwipeDetectorState extends State<_HorizontalSwipeDetector> {
   }
 }
 
-// ─── Banner ────────────────────────────────────────────────────────────────
+// ─── Banner carousel ──────────────────────────────────────────────────────
+//
+// Uses a [PageView] with [NeverScrollableScrollPhysics] driven entirely by
+// a [Timer]. No horizontal gesture recognizer is registered, so the outer
+// [_HorizontalSwipeDetector] handles tab-swipe without any arena conflict.
 
-class _BannerContent extends StatelessWidget {
+class _BannerSlide {
+  final String assetPath;
+  const _BannerSlide({required this.assetPath});
+}
+
+class _BannerCarousel extends StatefulWidget {
   final String username;
-  final VoidCallback? onProfileTap;
+  const _BannerCarousel({required this.username});
 
-  const _BannerContent({required this.username, this.onProfileTap});
+  @override
+  State<_BannerCarousel> createState() => _BannerCarouselState();
+}
+
+class _BannerCarouselState extends State<_BannerCarousel> {
+  static const _slides = [
+    _BannerSlide(assetPath: 'assets/promotion/elevem11.png'),
+    _BannerSlide(assetPath: 'assets/promotion/daraz_club.png'),
+    _BannerSlide(assetPath: 'assets/promotion/azadi_sale.jpg'),
+  ];
+
+  late final PageController _pageCtrl;
+  late final Timer _timer;
+  int _current = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _pageCtrl = PageController();
+    // Auto-advance every 3 seconds.
+    _timer = Timer.periodic(const Duration(seconds: 3), (_) {
+      _current = (_current + 1) % _slides.length;
+      if (_pageCtrl.hasClients) {
+        _pageCtrl.animateToPage(
+          _current,
+          duration: const Duration(milliseconds: 400),
+          curve: Curves.easeInOut,
+        );
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer.cancel();
+    _pageCtrl.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      color: AppColors.orange,
-      padding: const EdgeInsets.fromLTRB(16, 48, 16, 16),
-      child: Stack(
-        children: [
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                username.isNotEmpty ? 'Hello, $username 👋' : 'Welcome to Daraz',
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 20,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-              const SizedBox(height: 4),
-              const Text(
-                'Discover amazing products at great prices',
-                style: TextStyle(color: Colors.white70, fontSize: 13),
-              ),
-              const SizedBox(height: 56), // space for search bar PreferredSize
-            ],
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // ── Slides ──────────────────────────────────────────────────────
+        SizedBox(
+          height: 180,
+          child: PageView.builder(
+            controller: _pageCtrl,
+            // NeverScrollableScrollPhysics → no horizontal gesture recognizer
+            // registered. Timer drives all page transitions. This eliminates
+            // any arena conflict with the outer _HorizontalSwipeDetector.
+            physics: const NeverScrollableScrollPhysics(),
+            itemCount: _slides.length,
+            onPageChanged: (i) => setState(() => _current = i),
+            itemBuilder: (context, index) {
+              final slide = _slides[index];
+              return _BannerSlideTile(slide: slide);
+            },
           ),
-          // Profile avatar in top-right of the banner
-          if (onProfileTap != null)
-            Positioned(
-              top: 0,
-              right: 0,
-              child: GestureDetector(
-                onTap: onProfileTap,
-                child: CircleAvatar(
-                  radius: 18,
-                  backgroundColor: Colors.white24,
-                  child: Text(
-                    username.isNotEmpty ? username[0].toUpperCase() : 'U',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w700,
-                      fontSize: 15,
-                    ),
-                  ),
+        ),
+
+        // ── Dot indicators ───────────────────────────────────────────────
+        Container(
+          color: Colors.white,
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: List.generate(_slides.length, (i) {
+              final isActive = i == _current;
+              return AnimatedContainer(
+                duration: const Duration(milliseconds: 250),
+                margin: const EdgeInsets.symmetric(horizontal: 3),
+                width: isActive ? 20 : 6,
+                height: 6,
+                decoration: BoxDecoration(
+                  color: isActive ? AppColors.orange : AppColors.divider,
+                  borderRadius: BorderRadius.circular(3),
                 ),
-              ),
-            ),
-        ],
-      ),
+              );
+            }),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _BannerSlideTile extends StatelessWidget {
+  final _BannerSlide slide;
+  const _BannerSlideTile({required this.slide});
+
+  @override
+  Widget build(BuildContext context) {
+    return Image.asset(
+      slide.assetPath,
+      width: double.infinity,
+      height: 180,
+      fit: BoxFit.cover,
     );
   }
 }

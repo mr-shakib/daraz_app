@@ -5,7 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'core/constants/app_colors.dart';
 import 'features/auth/providers/auth_provider.dart';
 import 'features/auth/screens/login_screen.dart';
-import 'features/home/screens/home_screen.dart';
+import 'features/shell/main_shell.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -50,7 +50,7 @@ class _AuthGate extends ConsumerWidget {
     final authState = ref.watch(authProvider);
 
     return switch (authState) {
-      AuthAuthenticated() => const HomeScreen(),
+      AuthAuthenticated() => const MainShell(),
       AuthLoading() => const _SplashScreen(),
       _ => const LoginScreen(),
     };
